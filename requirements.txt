@@ -1,0 +1,5 @@
+numpy
+pydicom
+pillow
+google-genai
+scikit-learn
