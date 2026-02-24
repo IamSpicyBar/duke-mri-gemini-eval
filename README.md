@@ -23,7 +23,7 @@ export GEMINI_API_KEY=YOUR_KEY
 
 ## Main Workflow
 
-1. Prepare Nottingham subset and RGB images
+1. Prepare feature subset and RGB images
 
 ```bash
 python scripts/duke_gemini_pipeline.py prepare-nottingham-rgb
@@ -35,7 +35,7 @@ Key outputs:
 - `data/intermediate/nottingham_rgb_image_manifest.csv`
 - `data/images_rgb_nottingham/{PatientID}/slice_XXX_rgb.png`
 
-2. Build upload manifest (default command now targets Nottingham)
+2. Build upload manifest
 
 ```bash
 python scripts/duke_gemini_pipeline.py seed-upload-manifest
@@ -66,7 +66,7 @@ python scripts/duke_gemini_pipeline.py build-jsonl-nottingham \
 Main output JSONL:
 - `data/gemini/batch_requests_validation_nottingham.jsonl`
 
-4. Create a 3-row low-cost test batch
+4. (Optional) Create a 3-row low-cost test batch
 
 ```bash
 python scripts/duke_gemini_pipeline.py build-test3-jsonl
