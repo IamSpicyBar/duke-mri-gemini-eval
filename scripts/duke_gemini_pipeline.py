@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import pydicom
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pydicom.pixel_data_handlers.util import apply_voi_lut
 
 
@@ -65,6 +65,13 @@ NOTTINGHAM_FEATURES = [
     ("Neoadjuvant Endocrine Therapy Medications", "Neoadjuvant Endocrine Therapy", {0: "No", 1: "Yes"}),
     ("Staging(Nodes)#(Nx replaced by -1)[N]", "Staging N", None),
 ]
+
+REASONING_STRENGTH_TO_BUDGET = {
+    "off": 0,
+    "low": 256,
+    "medium": 1024,
+    "high": 2048,
+}
 
 
 def _col_idx(cell_ref: str) -> int:
@@ -506,14 +513,61 @@ def build_prompt_nottingham(patient_id: str, features: Dict[str, str], missing_i
         feature_lines.append("- No non-image features available")
     return (
         "You are given breast MRI RGB fusion slices and structured clinical features.\n"
+        "Image construction: slices are selected as 3 contiguous slices centered within the tumor slice range from annotation.\n"
+        "RGB fusion method: R=pre-contrast, G=first post-contrast, B=max(post1-pre, 0) to highlight enhancement.\n"
         "Task: predict Nottingham grade as a 3-class label: 1, 2, or 3.\n"
         "Return JSON only with schema: "
-        '{"prediction":1_or_2_or_3,"confidence":0_to_1,"rationale":"<=50 words"}.\n'
+        '{"prediction":1_or_2_or_3,"confidence":0_to_1,"reason":"<=70 words"}.\n'
+        "Always provide a concise reason grounded in imaging and clinical clues.\n"
         f"PatientID: {patient_id}\n"
         f"Missing RGB slices: {missing_images}\n"
         "Clinical features:\n"
         + "\n".join(feature_lines)
     )
+
+
+def build_prompt_nottingham_non_image_only(patient_id: str, features: Dict[str, str]) -> str:
+    feature_lines = []
+    for k, v in features.items():
+        if v:
+            feature_lines.append(f"- {k}: {v}")
+    if not feature_lines:
+        feature_lines.append("- No non-image features available")
+    return (
+        "You are given structured clinical features only (no MRI images provided).\n"
+        "Task: predict Nottingham grade as a 3-class label: 1, 2, or 3.\n"
+        "Return JSON only with schema: "
+        '{"prediction":1_or_2_or_3,"confidence":0_to_1,"reason":"<=70 words"}.\n'
+        "Always provide a concise reason grounded in clinical clues only.\n"
+        f"PatientID: {patient_id}\n"
+        "Clinical features:\n"
+        + "\n".join(feature_lines)
+    )
+
+
+def build_prompt_nottingham_image_only(patient_id: str, missing_images: int) -> str:
+    return (
+        "You are given breast MRI RGB fusion slices only (no clinical features provided).\n"
+        "Image construction: slices are selected as 3 contiguous slices centered within the tumor slice range from annotation.\n"
+        "RGB fusion method: R=pre-contrast, G=first post-contrast, B=max(post1-pre, 0) to highlight enhancement.\n"
+        "Task: predict Nottingham grade as a 3-class label: 1, 2, or 3.\n"
+        "Return JSON only with schema: "
+        '{"prediction":1_or_2_or_3,"confidence":0_to_1,"reason":"<=70 words"}.\n'
+        "Always provide a concise reason grounded in imaging clues only.\n"
+        f"PatientID: {patient_id}\n"
+        f"Missing RGB slices: {missing_images}\n"
+    )
+
+
+def resolve_thinking_budget(reasoning_strength: str, thinking_budget: Optional[int]) -> Optional[int]:
+    if thinking_budget is not None:
+        if thinking_budget < 0:
+            raise RuntimeError("--thinking-budget must be >= 0")
+        return thinking_budget
+    key = (reasoning_strength or "").strip().lower()
+    if key not in REASONING_STRENGTH_TO_BUDGET:
+        raise RuntimeError(f"Invalid --reasoning-strength: {reasoning_strength!r}")
+    return REASONING_STRENGTH_TO_BUDGET[key]
 
 
 def flatten_text(obj) -> str:
@@ -586,6 +640,33 @@ def parse_prediction_text_class(text: str, allowed_labels: List[int]) -> Tuple[O
         m2 = re.search(pat, text)
         pred = int(m2.group(1)) if m2 else None
         return pred, None, "regex_fallback" if pred is not None else "parse_error"
+
+
+def parse_prediction_text_class_with_reason(
+    text: str, allowed_labels: List[int]
+) -> Tuple[Optional[int], Optional[float], str, str]:
+    pred, conf, status = parse_prediction_text_class(text, allowed_labels)
+    reason = ""
+    text = (text or "").strip()
+    if not text:
+        return pred, conf, status, reason
+
+    cand = text
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if m:
+        cand = m.group(0)
+
+    try:
+        j = json.loads(cand)
+        raw_reason = j.get("reason")
+        if raw_reason is None:
+            raw_reason = j.get("rationale")
+        if raw_reason is not None:
+            reason = str(raw_reason).strip()
+    except Exception:
+        pass
+
+    return pred, conf, status, reason
 
 
 def ensure_dirs() -> None:
@@ -737,6 +818,9 @@ def cmd_prepare_nottingham_rgb(args: argparse.Namespace) -> None:
         base_dir=args.base_dir,
         png_size=args.png_size,
         annotation_sheet=args.annotation_sheet,
+        output_image_dir=args.output_image_dir,
+        output_manifest_csv=args.output_manifest_csv,
+        output_summary_json=args.output_summary_json,
     )
     print(json.dumps(info, indent=2, ensure_ascii=False))
 
@@ -800,7 +884,7 @@ def cmd_seed_upload_manifest(args: argparse.Namespace) -> None:
 
 def cmd_seed_upload_manifest_nottingham(args: argparse.Namespace) -> None:
     ensure_dirs()
-    src_path = Path("data/intermediate/nottingham_rgb_image_manifest.csv")
+    src_path = Path(args.source_manifest)
     if not src_path.exists():
         raise RuntimeError(f"Missing source manifest: {src_path}")
     rows = []
@@ -874,9 +958,11 @@ def cmd_upload_files_from_manifest(args: argparse.Namespace) -> None:
 def cmd_build_jsonl(args: argparse.Namespace) -> None:
     # Default pipeline now targets Nottingham-grade evaluation.
     n_args = argparse.Namespace(
-        upload_manifest="data/intermediate/upload_manifest_nottingham.csv",
+        upload_manifest=getattr(args, "upload_manifest", "data/intermediate/upload_manifest_nottingham.csv"),
         output_jsonl=getattr(args, "output_jsonl", "data/gemini/batch_requests_validation_nottingham.jsonl"),
         use_inline_data_from_local=getattr(args, "use_inline_data_from_local", False),
+        reasoning_strength=getattr(args, "reasoning_strength", "medium"),
+        thinking_budget=getattr(args, "thinking_budget", None),
     )
     cmd_build_jsonl_nottingham(n_args)
 
@@ -906,6 +992,15 @@ def cmd_build_jsonl_nottingham(args: argparse.Namespace) -> None:
         imgs_by_pid[pid].sort(key=lambda x: int(x.get("slice_index", "0") or 0))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    thinking_budget = resolve_thinking_budget(
+        reasoning_strength=getattr(args, "reasoning_strength", "medium"),
+        thinking_budget=getattr(args, "thinking_budget", None),
+    )
+    prompt_mode = getattr(args, "prompt_mode", "multimodal")
+    if prompt_mode not in {"multimodal", "non_image_only", "image_only"}:
+        raise RuntimeError(
+            f"Invalid --prompt-mode: {prompt_mode!r}. Expected one of: multimodal, non_image_only, image_only"
+        )
     rows = 0
     with out_path.open("w", encoding="utf-8") as f:
         for pid in sorted(clinical.keys()):
@@ -922,17 +1017,200 @@ def cmd_build_jsonl_nottingham(args: argparse.Namespace) -> None:
                         b64 = base64.b64encode(Path(local).read_bytes()).decode("ascii")
                         parts.append({"inline_data": {"mime_type": mime, "data": b64}})
             missing_images = max(0, 3 - len(parts))
-            prompt = build_prompt_nottingham(pid, clinical[pid], missing_images)
+            if prompt_mode == "multimodal":
+                prompt = build_prompt_nottingham(pid, clinical[pid], missing_images)
+            elif prompt_mode == "non_image_only":
+                prompt = build_prompt_nottingham_non_image_only(pid, clinical[pid])
+                parts = []
+            else:
+                prompt = build_prompt_nottingham_image_only(pid, missing_images)
+            generation_config = {"temperature": 0}
+            if thinking_budget is not None:
+                generation_config["thinkingConfig"] = {"thinkingBudget": thinking_budget}
             req = {
                 "key": pid,
                 "request": {
                     "contents": [{"role": "user", "parts": [{"text": prompt}] + parts}],
-                    "generationConfig": {"temperature": 0},
+                    "generationConfig": generation_config,
                 },
             }
             f.write(json.dumps(req) + "\n")
             rows += 1
-    print(f"Wrote Nottingham batch JSONL: {out_path} rows={rows}")
+    print(
+        f"Wrote Nottingham batch JSONL: {out_path} rows={rows} thinking_budget={thinking_budget} prompt_mode={prompt_mode}"
+    )
+
+
+def cmd_build_jsonl_nottingham_unimodal_baselines(args: argparse.Namespace) -> None:
+    base_kwargs = {
+        "upload_manifest": args.upload_manifest,
+        "use_inline_data_from_local": args.use_inline_data_from_local,
+        "reasoning_strength": args.reasoning_strength,
+        "thinking_budget": args.thinking_budget,
+    }
+    cmd_build_jsonl_nottingham(
+        argparse.Namespace(
+            output_jsonl=args.output_jsonl_non_image_only,
+            prompt_mode="non_image_only",
+            **base_kwargs,
+        )
+    )
+    cmd_build_jsonl_nottingham(
+        argparse.Namespace(
+            output_jsonl=args.output_jsonl_image_only,
+            prompt_mode="image_only",
+            **base_kwargs,
+        )
+    )
+
+
+def _extract_response_text(resp) -> str:
+    txt = getattr(resp, "text", None)
+    if txt:
+        return str(txt).strip()
+    try:
+        cands = getattr(resp, "candidates", None) or []
+        if not cands:
+            return ""
+        parts = getattr(cands[0].content, "parts", None) or []
+        out = []
+        for p in parts:
+            t = getattr(p, "text", None)
+            if t:
+                out.append(str(t))
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+
+
+def cmd_infer_nottingham_online(args: argparse.Namespace) -> None:
+    from google.genai import types
+
+    ensure_dirs()
+    client = _get_client(args.api_key)
+    clin_path = Path("data/intermediate/clinical_features_validation_nottingham.csv")
+    upload_path = Path(args.upload_manifest)
+    out_path = Path(args.output_jsonl)
+    if not clin_path.exists():
+        raise RuntimeError(f"Missing clinical file: {clin_path}")
+    if not upload_path.exists():
+        raise RuntimeError(f"Missing upload manifest: {upload_path}")
+
+    clinical = {}
+    with clin_path.open(newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            pid = r.pop("PatientID")
+            r.pop("target_nottingham_grade", None)
+            clinical[pid] = r
+
+    imgs_by_pid: Dict[str, List[Dict[str, str]]] = {}
+    with upload_path.open(newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            imgs_by_pid.setdefault(r["PatientID"], []).append(r)
+    for pid in imgs_by_pid:
+        imgs_by_pid[pid].sort(key=lambda x: int(x.get("slice_index", "0") or 0))
+
+    thinking_budget = resolve_thinking_budget(
+        reasoning_strength=getattr(args, "reasoning_strength", "medium"),
+        thinking_budget=getattr(args, "thinking_budget", None),
+    )
+    prompt_mode = getattr(args, "prompt_mode", "multimodal")
+    if prompt_mode not in {"multimodal", "non_image_only", "image_only"}:
+        raise RuntimeError(
+            f"Invalid --prompt-mode: {prompt_mode!r}. Expected one of: multimodal, non_image_only, image_only"
+        )
+    cfg = types.GenerateContentConfig(temperature=0)
+    if thinking_budget is not None:
+        cfg.thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    done = 0
+    with out_path.open("w", encoding="utf-8") as out_f:
+        for i, pid in enumerate(sorted(clinical.keys()), start=1):
+            img_parts = []
+            images = imgs_by_pid.get(pid, [])
+            for rec in images:
+                uri = (rec.get("gemini_file_uri") or "").strip()
+                mime = rec.get("mime_type", "image/png") or "image/png"
+                if uri:
+                    img_parts.append(types.Part.from_uri(file_uri=uri, mime_type=mime))
+                else:
+                    local = (rec.get("local_png_path") or "").strip()
+                    if args.use_inline_data_from_local and local and Path(local).exists():
+                        img_parts.append(types.Part.from_bytes(data=Path(local).read_bytes(), mime_type=mime))
+            missing_images = max(0, 3 - len(img_parts))
+            if prompt_mode == "multimodal":
+                prompt = build_prompt_nottingham(pid, clinical[pid], missing_images)
+                req_parts = [types.Part.from_text(text=prompt)] + img_parts
+            elif prompt_mode == "non_image_only":
+                prompt = build_prompt_nottingham_non_image_only(pid, clinical[pid])
+                req_parts = [types.Part.from_text(text=prompt)]
+            else:
+                prompt = build_prompt_nottingham_image_only(pid, missing_images)
+                req_parts = [types.Part.from_text(text=prompt)] + img_parts
+
+            response_text = ""
+            status = "ok"
+            error = ""
+            for attempt in range(args.max_retries):
+                try:
+                    resp = client.models.generate_content(
+                        model=args.model,
+                        contents=[types.Content(role="user", parts=req_parts)],
+                        config=cfg,
+                    )
+                    response_text = _extract_response_text(resp)
+                    if not response_text:
+                        status = "empty_response"
+                    break
+                except Exception as e:
+                    if attempt == args.max_retries - 1:
+                        status = "error"
+                        error = str(e)
+                    else:
+                        time.sleep(min(10, 2 ** attempt))
+
+            out_row = {"key": pid, "response_text": response_text, "status": status}
+            if error:
+                out_row["error"] = error
+            out_f.write(json.dumps(out_row, ensure_ascii=False) + "\n")
+            done += 1
+            if i % 10 == 0:
+                print(f"processed {i}/{len(clinical)} patients...")
+            if args.sleep_sec > 0:
+                time.sleep(args.sleep_sec)
+
+    print(
+        f"Wrote online inference JSONL: {out_path} rows={done} "
+        f"model={args.model} thinking_budget={thinking_budget} prompt_mode={prompt_mode}"
+    )
+
+
+def cmd_infer_nottingham_online_unimodal_baselines(args: argparse.Namespace) -> None:
+    base_kwargs = {
+        "api_key": args.api_key,
+        "model": args.model,
+        "upload_manifest": args.upload_manifest,
+        "use_inline_data_from_local": args.use_inline_data_from_local,
+        "reasoning_strength": args.reasoning_strength,
+        "thinking_budget": args.thinking_budget,
+        "max_retries": args.max_retries,
+        "sleep_sec": args.sleep_sec,
+    }
+    cmd_infer_nottingham_online(
+        argparse.Namespace(
+            output_jsonl=args.output_jsonl_non_image_only,
+            prompt_mode="non_image_only",
+            **base_kwargs,
+        )
+    )
+    cmd_infer_nottingham_online(
+        argparse.Namespace(
+            output_jsonl=args.output_jsonl_image_only,
+            prompt_mode="image_only",
+            **base_kwargs,
+        )
+    )
 
 
 def cmd_build_test3_jsonl(args: argparse.Namespace) -> None:
@@ -1163,25 +1441,73 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     cmd_evaluate_nottingham(args)
 
 
-def cmd_evaluate_nottingham(args: argparse.Namespace) -> None:
+def _load_nottingham_gold() -> Dict[str, int]:
     gold = {}
     with Path("data/intermediate/clinical_features_validation_nottingham.csv").open(newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             gold[r["PatientID"]] = int(float(r["target_nottingham_grade"]))
+    return gold
+
+
+def _safe_run_appendix(path: Path) -> str:
+    rel = str(path).replace("\\", "/")
+    rel = re.sub(r"^[./]+", "", rel)
+    rel = re.sub(r"\.jsonl$", "", rel, flags=re.I)
+    rel = re.sub(r"[^A-Za-z0-9._-]+", "_", rel)
+    rel = re.sub(r"_+", "_", rel).strip("_")
+    return rel or "run"
+
+
+def _rel_response_path(path: Path) -> str:
+    p = path.resolve()
+    try:
+        return str(p.relative_to(Path.cwd().resolve())).replace("\\", "/")
+    except Exception:
+        return str(path).replace("\\", "/")
+
+
+def _load_or_init_run_name_map(response_files: List[Path], map_path: Path) -> Dict[str, str]:
+    run_map: Dict[str, str] = {}
+    if map_path.exists():
+        try:
+            obj = json.loads(map_path.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                run_map = {str(k): str(v) for k, v in obj.items()}
+        except Exception:
+            run_map = {}
+
+    changed = False
+    for fp in response_files:
+        key = _rel_response_path(fp)
+        if key not in run_map:
+            run_map[key] = f"TODO_name_{_safe_run_appendix(fp)}"
+            changed = True
+
+    if changed or not map_path.exists():
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        map_path.write_text(json.dumps(run_map, indent=2, ensure_ascii=False), encoding="utf-8")
+    return run_map
+
+
+def _evaluate_nottingham_file(
+    results_jsonl: Path,
+    out_eval_csv: Path,
+    out_metrics_json: Path,
+) -> Dict[str, object]:
+    gold = _load_nottingham_gold()
 
     preds = {}
-    with Path(args.results_jsonl).open(encoding="utf-8") as f:
+    with results_jsonl.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             obj = json.loads(line)
             key = obj.get("key")
-            text = flatten_text(obj)
-            pred, conf, status = parse_prediction_text_class(text, [1, 2, 3])
-            preds[key] = {"prediction": pred, "confidence": conf, "parse_status": status}
+            text = obj.get("response_text") if isinstance(obj, dict) and "response_text" in obj else flatten_text(obj)
+            pred, conf, status, reason = parse_prediction_text_class_with_reason(text, [1, 2, 3])
+            preds[key] = {"prediction": pred, "confidence": conf, "parse_status": status, "reason": reason}
 
-    out = Path("data/results/nottingham_eval.csv")
     rows = []
     for pid, y in gold.items():
         p = preds.get(pid, {})
@@ -1191,28 +1517,183 @@ def cmd_evaluate_nottingham(args: argparse.Namespace) -> None:
                 "gold_nottingham": y,
                 "prediction": "" if p.get("prediction") is None else p.get("prediction"),
                 "confidence": "" if p.get("confidence") is None else p.get("confidence"),
+                "reason": p.get("reason", ""),
                 "parse_status": p.get("parse_status", "missing_result"),
             }
         )
-    with out.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["PatientID", "gold_nottingham", "prediction", "confidence", "parse_status"])
+    out_eval_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_eval_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["PatientID", "gold_nottingham", "prediction", "confidence", "reason", "parse_status"],
+        )
         w.writeheader()
         for r in rows:
             w.writerow(r)
 
-    from sklearn.metrics import balanced_accuracy_score, f1_score
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, precision_score, recall_score
 
     yt = [r["gold_nottingham"] for r in rows if r["prediction"] in (1, 2, 3)]
     yp = [r["prediction"] for r in rows if r["prediction"] in (1, 2, 3)]
     metrics = {}
     if yt:
+        metrics["accuracy"] = accuracy_score(yt, yp)
         metrics["balanced_accuracy"] = balanced_accuracy_score(yt, yp)
+        metrics["macro_precision"] = precision_score(yt, yp, average="macro", zero_division=0)
+        metrics["macro_recall"] = recall_score(yt, yp, average="macro", zero_division=0)
         metrics["macro_f1"] = f1_score(yt, yp, average="macro")
+        metrics["micro_precision"] = precision_score(yt, yp, average="micro", zero_division=0)
+        metrics["micro_recall"] = recall_score(yt, yp, average="micro", zero_division=0)
+        metrics["micro_f1"] = f1_score(yt, yp, average="micro")
         metrics["num_predicted"] = len(yt)
         metrics["num_gold"] = len(rows)
-    Path("data/results/nottingham_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(f"Saved evaluation rows to {out}")
-    print(f"Saved metrics to data/results/nottingham_metrics.json: {json.dumps(metrics)}")
+    out_metrics_json.parent.mkdir(parents=True, exist_ok=True)
+    out_metrics_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(f"Saved evaluation rows to {out_eval_csv}")
+    print(f"Saved metrics to {out_metrics_json}: {json.dumps(metrics)}")
+    return metrics
+
+
+def _plot_run_comparison(comparison_rows: List[Dict[str, object]], out_png: Path) -> None:
+    if not comparison_rows:
+        return
+
+    run_names = [str(r.get("run_name", r["run"])) for r in comparison_rows]
+    acc = [float(r.get("accuracy", 0.0) or 0.0) for r in comparison_rows]
+    macro_f1 = [float(r.get("macro_f1", 0.0) or 0.0) for r in comparison_rows]
+    metric_names = ["Accuracy", "Macro F1"]
+    metric_values = [acc, macro_f1]
+
+    n_runs = len(run_names)
+    n_metrics = len(metric_names)
+    width = max(1100, 220 * n_runs)
+    height = 680
+    left = 90
+    right = 340
+    top = 70
+    bottom = 130
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    group_w = plot_w / max(1, n_metrics)
+    bar_gap = 6
+    max_bar_area = max(40, group_w * 0.85)
+    bar_w = int(max(10, min(50, (max_bar_area - bar_gap * max(0, n_runs - 1)) / max(1, n_runs))))
+    font = ImageFont.load_default()
+    colors = [
+        (66, 133, 244),
+        (52, 168, 83),
+        (251, 188, 5),
+        (234, 67, 53),
+        (171, 71, 188),
+        (0, 172, 193),
+        (255, 112, 67),
+        (124, 179, 66),
+    ]
+
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Axes + grid
+    draw.line([(left, top), (left, top + plot_h)], fill=(30, 30, 30), width=2)
+    draw.line([(left, top + plot_h), (left + plot_w, top + plot_h)], fill=(30, 30, 30), width=2)
+    for i in range(6):
+        yv = i / 5
+        y = top + int((1.0 - yv) * plot_h)
+        draw.line([(left, y), (left + plot_w, y)], fill=(225, 225, 225), width=1)
+        draw.text((18, y - 6), f"{yv:.1f}", fill=(80, 80, 80), font=font)
+
+    # Grouped bars by metric type.
+    for mi, metric in enumerate(metric_names):
+        group_left = left + int(mi * group_w + (group_w - (n_runs * bar_w + max(0, n_runs - 1) * bar_gap)) / 2)
+        for ri, run_name in enumerate(run_names):
+            val = max(0.0, min(1.0, metric_values[mi][ri]))
+            h = int(val * plot_h)
+            x0 = group_left + ri * (bar_w + bar_gap)
+            x1 = x0 + bar_w
+            y0 = top + plot_h - h
+            y1 = top + plot_h
+            fill = colors[ri % len(colors)]
+            outline = tuple(max(0, c - 30) for c in fill)
+            draw.rectangle([(x0, y0), (x1, y1)], fill=fill, outline=outline)
+            ann = run_name if len(run_name) <= 12 else run_name[:12]
+            tw = draw.textlength(ann, font=font)
+            draw.text((x0 + (bar_w - tw) / 2, max(top, y0 - 13)), ann, fill=(70, 70, 70), font=font)
+        twm = draw.textlength(metric, font=font)
+        group_center = left + (mi + 0.5) * group_w
+        draw.text((group_center - twm / 2, top + plot_h + 14), metric, fill=(40, 40, 40), font=font)
+
+    # Title + legend with full mapped run names.
+    title = "Nottingham Comparison Grouped by Metric"
+    tw = draw.textlength(title, font=font)
+    draw.text(((width - tw) / 2, 20), title, fill=(20, 20, 20), font=font)
+    legend_x = width - right + 20
+    legend_y = top + 10
+    draw.text((legend_x, legend_y - 20), "Runs (mapped names):", fill=(30, 30, 30), font=font)
+    for ri, run_name in enumerate(run_names):
+        y = legend_y + ri * 22
+        fill = colors[ri % len(colors)]
+        outline = tuple(max(0, c - 30) for c in fill)
+        draw.rectangle([(legend_x, y), (legend_x + 14, y + 14)], fill=fill, outline=outline)
+        label = run_name if len(run_name) <= 36 else run_name[:33] + "..."
+        draw.text((legend_x + 20, y - 1), label, fill=(50, 50, 50), font=font)
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_png, format="PNG")
+
+
+def cmd_evaluate_nottingham(args: argparse.Namespace) -> None:
+    _evaluate_nottingham_file(
+        results_jsonl=Path(args.results_jsonl),
+        out_eval_csv=Path("data/results/nottingham_eval.csv"),
+        out_metrics_json=Path("data/results/nottingham_metrics.json"),
+    )
+
+
+def cmd_evaluate_nottingham_all_runs(args: argparse.Namespace) -> None:
+    response_dirs = [Path(x) for x in args.response_dirs]
+    response_files: List[Path] = []
+    for d in response_dirs:
+        if d.exists() and d.is_dir():
+            response_files.extend(sorted(d.glob("*.jsonl")))
+    if not response_files:
+        raise RuntimeError(f"No response JSONL files found in: {', '.join(str(d) for d in response_dirs)}")
+
+    run_name_map = _load_or_init_run_name_map(response_files, Path(args.run_name_map))
+    compare_rows = []
+    for fp in response_files:
+        appendix = _safe_run_appendix(fp)
+        response_rel = _rel_response_path(fp)
+        run_name = run_name_map.get(response_rel, appendix)
+        eval_csv = Path(args.results_dir) / f"nottingham_eval__{appendix}.csv"
+        metrics_json = Path(args.results_dir) / f"nottingham_metrics__{appendix}.json"
+        metrics = _evaluate_nottingham_file(fp, eval_csv, metrics_json)
+        compare_rows.append(
+            {
+                "run": appendix,
+                "run_name": run_name,
+                "response_jsonl": response_rel,
+                "accuracy": metrics.get("accuracy"),
+                "macro_f1": metrics.get("macro_f1"),
+                "num_predicted": metrics.get("num_predicted", 0),
+                "num_gold": metrics.get("num_gold", 0),
+            }
+        )
+
+    summary_csv = Path(args.results_dir) / "nottingham_run_comparison.csv"
+    with summary_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["run", "run_name", "response_jsonl", "accuracy", "macro_f1", "num_predicted", "num_gold"],
+        )
+        w.writeheader()
+        for r in compare_rows:
+            w.writerow(r)
+
+    plot_png = Path(args.results_dir) / "nottingham_run_comparison_accuracy_macro_f1.png"
+    _plot_run_comparison(compare_rows, plot_png)
+    print(f"Wrote/updated run-name map: {args.run_name_map}")
+    print(f"Wrote run comparison CSV: {summary_csv}")
+    print(f"Wrote run comparison plot: {plot_png}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1231,6 +1712,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_prepare_n.add_argument("--base-dir", default="/mnt/e/BreastCancerData", help="Directory containing DUKE files")
     p_prepare_n.add_argument("--png-size", type=int, default=512)
     p_prepare_n.add_argument("--annotation-sheet", default="Sheet1")
+    p_prepare_n.add_argument("--output-image-dir", default="data/images_rgb_nottingham_256crop")
+    p_prepare_n.add_argument("--output-manifest-csv", default="data/intermediate/nottingham_rgb_image_manifest_256crop.csv")
+    p_prepare_n.add_argument("--output-summary-json", default="data/intermediate/nottingham_prepare_summary_256crop.json")
     p_prepare_n.set_defaults(func=cmd_prepare_nottingham_rgb)
 
     p_upload = sub.add_parser("upload-files", help="Upload PNGs to Gemini Files API")
@@ -1239,9 +1723,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_upload.set_defaults(func=cmd_upload_files)
 
     p_seed = sub.add_parser("seed-upload-manifest", help="Seed upload manifest (default: Nottingham RGB)")
+    p_seed.add_argument("--source-manifest", default="data/intermediate/nottingham_rgb_image_manifest_256crop.csv")
     p_seed.set_defaults(func=cmd_seed_upload_manifest)
 
     p_seed_n = sub.add_parser("seed-upload-manifest-nottingham", help="Seed upload manifest for Nottingham RGB images")
+    p_seed_n.add_argument("--source-manifest", default="data/intermediate/nottingham_rgb_image_manifest_256crop.csv")
     p_seed_n.set_defaults(func=cmd_seed_upload_manifest_nottingham)
 
     p_upload_m = sub.add_parser("upload-files-from-manifest", help="Upload image files listed in a manifest")
@@ -1252,12 +1738,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_upload_m.set_defaults(func=cmd_upload_files_from_manifest)
 
     p_jsonl = sub.add_parser("build-jsonl", help="Build batch request JSONL (default: Nottingham)")
+    p_jsonl.add_argument("--upload-manifest", default="data/intermediate/upload_manifest_nottingham.csv")
     p_jsonl.add_argument("--output-jsonl", default="data/gemini/batch_requests_validation_nottingham.jsonl")
     p_jsonl.add_argument(
         "--use-inline-data-from-local",
         action="store_true",
         help="If gemini_file_uri is missing, encode local_png_path as inline_data.",
     )
+    p_jsonl.add_argument("--reasoning-strength", choices=["off", "low", "medium", "high"], default="medium")
+    p_jsonl.add_argument("--thinking-budget", type=int, default=None)
     p_jsonl.set_defaults(func=cmd_build_jsonl)
 
     p_jsonl_n = sub.add_parser("build-jsonl-nottingham", help="Build Nottingham-grade batch request JSONL")
@@ -1268,7 +1757,37 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If gemini_file_uri is missing, encode local_png_path as inline_data.",
     )
+    p_jsonl_n.add_argument("--reasoning-strength", choices=["off", "low", "medium", "high"], default="medium")
+    p_jsonl_n.add_argument("--thinking-budget", type=int, default=None)
+    p_jsonl_n.add_argument(
+        "--prompt-mode",
+        choices=["multimodal", "non_image_only", "image_only"],
+        default="multimodal",
+        help="Prompt/input mode for Nottingham requests.",
+    )
     p_jsonl_n.set_defaults(func=cmd_build_jsonl_nottingham)
+
+    p_jsonl_u = sub.add_parser(
+        "build-jsonl-nottingham-unimodal-baselines",
+        help="Build two additional Nottingham JSONLs: non-image-only and image-only baselines",
+    )
+    p_jsonl_u.add_argument("--upload-manifest", default="data/intermediate/upload_manifest_nottingham.csv")
+    p_jsonl_u.add_argument(
+        "--output-jsonl-non-image-only",
+        default="data/gemini/batch_requests_validation_nottingham_non_image_only.jsonl",
+    )
+    p_jsonl_u.add_argument(
+        "--output-jsonl-image-only",
+        default="data/gemini/batch_requests_validation_nottingham_image_only.jsonl",
+    )
+    p_jsonl_u.add_argument(
+        "--use-inline-data-from-local",
+        action="store_true",
+        help="If gemini_file_uri is missing, encode local_png_path as inline_data.",
+    )
+    p_jsonl_u.add_argument("--reasoning-strength", choices=["off", "low", "medium", "high"], default="medium")
+    p_jsonl_u.add_argument("--thinking-budget", type=int, default=None)
+    p_jsonl_u.set_defaults(func=cmd_build_jsonl_nottingham_unimodal_baselines)
 
     p_test3 = sub.add_parser("build-test3-jsonl", help="Build deterministic 3-row low-cost test JSONL")
     p_test3.add_argument("--source-jsonl", default="data/gemini/batch_requests_validation_nottingham.jsonl")
@@ -1283,6 +1802,57 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit.add_argument("--jsonl-path", default="data/gemini/batch_requests_validation_nottingham.jsonl")
     p_submit.add_argument("--display-name", default="duke-breast-mri-nottingham-validation")
     p_submit.set_defaults(func=cmd_submit_batch)
+
+    p_infer = sub.add_parser(
+        "infer-nottingham-online",
+        help="Run direct (non-batch) multimodal Nottingham inference with Gemini",
+    )
+    p_infer.add_argument("--api-key", default=None)
+    p_infer.add_argument("--model", default="gemini-2.5-flash")
+    p_infer.add_argument("--upload-manifest", default="data/intermediate/upload_manifest_nottingham.csv")
+    p_infer.add_argument("--output-jsonl", default="data/gemini/nottingham_online_results.jsonl")
+    p_infer.add_argument(
+        "--use-inline-data-from-local",
+        action="store_true",
+        help="If gemini_file_uri is missing, embed local_png_path bytes inline.",
+    )
+    p_infer.add_argument(
+        "--prompt-mode",
+        choices=["multimodal", "non_image_only", "image_only"],
+        default="multimodal",
+        help="Prompt/input mode for online inference.",
+    )
+    p_infer.add_argument("--reasoning-strength", choices=["off", "low", "medium", "high"], default="medium")
+    p_infer.add_argument("--thinking-budget", type=int, default=None)
+    p_infer.add_argument("--max-retries", type=int, default=3)
+    p_infer.add_argument("--sleep-sec", type=float, default=0.0)
+    p_infer.set_defaults(func=cmd_infer_nottingham_online)
+
+    p_infer_u = sub.add_parser(
+        "infer-nottingham-online-unimodal-baselines",
+        help="Run direct online inference for both non-image-only and image-only baselines",
+    )
+    p_infer_u.add_argument("--api-key", default=None)
+    p_infer_u.add_argument("--model", default="gemini-2.5-flash")
+    p_infer_u.add_argument("--upload-manifest", default="data/intermediate/upload_manifest_nottingham.csv")
+    p_infer_u.add_argument(
+        "--output-jsonl-non-image-only",
+        default="data/responses/nottingham_online_non_image_only_results.jsonl",
+    )
+    p_infer_u.add_argument(
+        "--output-jsonl-image-only",
+        default="data/responses/nottingham_online_image_only_results.jsonl",
+    )
+    p_infer_u.add_argument(
+        "--use-inline-data-from-local",
+        action="store_true",
+        help="If gemini_file_uri is missing, embed local_png_path bytes inline.",
+    )
+    p_infer_u.add_argument("--reasoning-strength", choices=["off", "low", "medium", "high"], default="medium")
+    p_infer_u.add_argument("--thinking-budget", type=int, default=None)
+    p_infer_u.add_argument("--max-retries", type=int, default=3)
+    p_infer_u.add_argument("--sleep-sec", type=float, default=0.0)
+    p_infer_u.set_defaults(func=cmd_infer_nottingham_online_unimodal_baselines)
 
     p_poll = sub.add_parser("poll-batch", help="Poll Gemini batch job status")
     p_poll.add_argument("--api-key", default=None)
@@ -1311,6 +1881,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval_n = sub.add_parser("evaluate-nottingham", help="Parse Nottingham batch results and compute metrics")
     p_eval_n.add_argument("--results-jsonl", required=True, help="Batch output JSONL path")
     p_eval_n.set_defaults(func=cmd_evaluate_nottingham)
+
+    p_eval_all = sub.add_parser(
+        "evaluate-nottingham-all-runs",
+        help="Evaluate all response JSONLs in folders and produce per-run outputs plus comparison plot",
+    )
+    p_eval_all.add_argument(
+        "--response-dirs",
+        nargs="+",
+        default=["data/responses", "data/batch_responses"],
+        help="Directories containing response JSONL files",
+    )
+    p_eval_all.add_argument("--results-dir", default="data/results")
+    p_eval_all.add_argument(
+        "--run-name-map",
+        default="data/results/response_run_name_map.json",
+        help="JSON map from response JSONL path to a human-friendly run name.",
+    )
+    p_eval_all.set_defaults(func=cmd_evaluate_nottingham_all_runs)
 
     return p
 

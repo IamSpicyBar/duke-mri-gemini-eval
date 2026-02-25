@@ -52,6 +52,8 @@ NOTTINGHAM_FEATURES = [
     ("Staging(Nodes)#(Nx replaced by -1)[N]", "Staging N", None),
 ]
 
+CROP_SIZE = 256
+
 
 def _col_idx(cell_ref: str) -> int:
     m = re.match(r"([A-Z]+)", cell_ref)
@@ -243,17 +245,13 @@ def parse_slice_number(filepath: str) -> int:
 
 def normalize_channel(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float32)
-    valid = arr[np.isfinite(arr)]
-    if valid.size == 0:
+    if arr.size == 0:
         return np.zeros(arr.shape, dtype=np.uint8)
-    lo = np.percentile(valid, 1)
-    hi = np.percentile(valid, 99)
-    if hi <= lo:
-        lo = float(valid.min())
-        hi = float(valid.max())
-    if hi <= lo:
+    mn = float(np.nanmin(arr))
+    mx = float(np.nanmax(arr))
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
         return np.zeros(arr.shape, dtype=np.uint8)
-    out = np.clip((arr - lo) / (hi - lo), 0.0, 1.0) * 255.0
+    out = np.clip((arr - mn) / (mx - mn), 0.0, 1.0) * 255.0
     return out.astype(np.uint8)
 
 
@@ -284,12 +282,57 @@ def sample_three_slices(start_idx: int, end_idx: int, depth: int) -> List[int]:
     if start_idx > end_idx:
         start_idx, end_idx = end_idx, start_idx
     center = (start_idx + end_idx) // 2
-    return [max(0, min(i, depth - 1)) for i in [center - 1, center, center + 1]]
+    first = center - 1
+    last = center + 1
+    if first < start_idx:
+        first = start_idx
+        last = first + 2
+    if last > end_idx:
+        last = end_idx
+        first = max(start_idx, last - 2)
+    return [max(0, min(i, depth - 1)) for i in range(first, last + 1)]
 
 
 def make_rgb_fusion(pre_slice: np.ndarray, post1_slice: np.ndarray) -> np.ndarray:
     sub = np.clip(post1_slice - pre_slice, 0, None)
     return np.stack([normalize_channel(pre_slice), normalize_channel(post1_slice), normalize_channel(sub)], axis=-1)
+
+
+def crop_rgb_centered_256(rgb: np.ndarray, annot_row: Dict[str, str]) -> np.ndarray:
+    h, w = rgb.shape[:2]
+    if h <= 0 or w <= 0:
+        return rgb
+    try:
+        start_row = int(float(annot_row["Start Row"])) - 1
+        end_row = int(float(annot_row["End Row"]))
+        start_col = int(float(annot_row["Start Column"])) - 1
+        end_col = int(float(annot_row["End Column"]))
+    except Exception:
+        return rgb
+
+    center_r = (start_row + end_row) // 2
+    center_c = (start_col + end_col) // 2
+    r1 = center_r - CROP_SIZE // 2
+    c1 = center_c - CROP_SIZE // 2
+    r2 = r1 + CROP_SIZE
+    c2 = c1 + CROP_SIZE
+
+    if r1 < 0:
+        r1, r2 = 0, CROP_SIZE
+    if r2 > h:
+        r1, r2 = h - CROP_SIZE, h
+    if c1 < 0:
+        c1, c2 = 0, CROP_SIZE
+    if c2 > w:
+        c1, c2 = w - CROP_SIZE, w
+
+    r1 = max(0, r1)
+    c1 = max(0, c1)
+    r2 = min(h, r2)
+    c2 = min(w, c2)
+    if r2 <= r1 or c2 <= c1:
+        return rgb
+    return rgb[r1:r2, c1:c2]
 
 
 def save_rgb_png(arr: np.ndarray, output_path: Path, resize: int = 512) -> None:
@@ -312,7 +355,14 @@ def _decode(raw: str, decode_map: Optional[Dict[int, str]]) -> str:
         return raw
 
 
-def run_prepare_nottingham_rgb(base_dir: str, png_size: int, annotation_sheet: str) -> Dict[str, object]:
+def run_prepare_nottingham_rgb(
+    base_dir: str,
+    png_size: int,
+    annotation_sheet: str,
+    output_image_dir: str = "data/images_rgb_nottingham_256crop",
+    output_manifest_csv: str = "data/intermediate/nottingham_rgb_image_manifest_256crop.csv",
+    output_summary_json: str = "data/intermediate/nottingham_prepare_summary_256crop.json",
+) -> Dict[str, object]:
     base = Path(base_dir)
     manifest = base / "manifest-1654812109500"
     metadata_path = manifest / "metadata.csv"
@@ -330,7 +380,15 @@ def run_prepare_nottingham_rgb(base_dir: str, png_size: int, annotation_sheet: s
         raise RuntimeError("Annotation workbook is empty")
     annot_header = annot_rows_raw[0]
     annot_idx = {h: i for i, h in enumerate(annot_header) if h}
-    req_ann = ["Patient ID", "Start Slice", "End Slice"]
+    req_ann = [
+        "Patient ID",
+        "Start Slice",
+        "End Slice",
+        "Start Row",
+        "End Row",
+        "Start Column",
+        "End Column",
+    ]
     miss_ann = [c for c in req_ann if c not in annot_idx]
     if miss_ann:
         raise RuntimeError(f"Annotation sheet missing required columns: {miss_ann}")
@@ -342,6 +400,10 @@ def run_prepare_nottingham_rgb(base_dir: str, png_size: int, annotation_sheet: s
         annot_by_id[pid] = {
             "Start Slice": row[annot_idx["Start Slice"]].strip() if len(row) > annot_idx["Start Slice"] else "",
             "End Slice": row[annot_idx["End Slice"]].strip() if len(row) > annot_idx["End Slice"] else "",
+            "Start Row": row[annot_idx["Start Row"]].strip() if len(row) > annot_idx["Start Row"] else "",
+            "End Row": row[annot_idx["End Row"]].strip() if len(row) > annot_idx["End Row"] else "",
+            "Start Column": row[annot_idx["Start Column"]].strip() if len(row) > annot_idx["Start Column"] else "",
+            "End Column": row[annot_idx["End Column"]].strip() if len(row) > annot_idx["End Column"] else "",
         }
 
     requested_cols = [x[0] for x in NOTTINGHAM_FEATURES]
@@ -407,7 +469,7 @@ def run_prepare_nottingham_rgb(base_dir: str, png_size: int, annotation_sheet: s
         for r in csv.DictReader(f):
             by_pid.setdefault(r["PatientID"], {})[r["phase_slot"]] = r.get("dicom_dir", "")
 
-    img_root = Path("data/images_rgb_nottingham")
+    img_root = Path(output_image_dir)
     if img_root.exists():
         shutil.rmtree(img_root)
     img_root.mkdir(parents=True, exist_ok=True)
@@ -443,6 +505,7 @@ def run_prepare_nottingham_rgb(base_dir: str, png_size: int, annotation_sheet: s
         wrote = False
         for sidx in idxs:
             rgb = make_rgb_fusion(vol_pre[sidx], vol_post[sidx])
+            rgb = crop_rgb_centered_256(rgb, annot_by_id[pid])
             out_path = img_root / pid / f"slice_{sidx:03d}_rgb.png"
             save_rgb_png(rgb, out_path, resize=png_size)
             manifest_rows.append(
@@ -459,7 +522,9 @@ def run_prepare_nottingham_rgb(base_dir: str, png_size: int, annotation_sheet: s
         if i % 10 == 0:
             print(f"processed {i}/{len(filtered_ids)} labeled patients...")
 
-    with Path("data/intermediate/nottingham_rgb_image_manifest.csv").open("w", newline="", encoding="utf-8") as f:
+    manifest_out = Path(output_manifest_csv)
+    manifest_out.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_out.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["PatientID", "slice_index", "local_png_path", "mime_type"])
         w.writeheader()
         for r in manifest_rows:
@@ -473,9 +538,14 @@ def run_prepare_nottingham_rgb(base_dir: str, png_size: int, annotation_sheet: s
         "skipped_missing_series": skipped_missing_series,
         "skipped_load_fail": skipped_load_fail,
         "missing_requested_feature_columns": missing_feature_cols,
-        "cropping_applied": False,
+        "cropping_applied": True,
+        "crop_size": CROP_SIZE,
+        "output_image_dir": str(img_root),
+        "output_manifest_csv": str(manifest_out),
     }
-    Path("data/intermediate/nottingham_prepare_summary.json").write_text(
+    summary_out = Path(output_summary_json)
+    summary_out.parent.mkdir(parents=True, exist_ok=True)
+    summary_out.write_text(
         json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     return info
