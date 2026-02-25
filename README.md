@@ -32,8 +32,8 @@ python scripts/duke_gemini_pipeline.py prepare-nottingham-rgb
 Key outputs:
 - `data/intermediate/validation_patients_nottingham.csv`
 - `data/intermediate/clinical_features_validation_nottingham.csv`
-- `data/intermediate/nottingham_rgb_image_manifest.csv`
-- `data/images_rgb_nottingham/{PatientID}/slice_XXX_rgb.png`
+- `data/intermediate/nottingham_rgb_image_manifest_256crop.csv`
+- `data/images_rgb_nottingham_256crop/{PatientID}/slice_XXX_rgb.png`
 
 2. Build upload manifest (default command now targets Nottingham)
 
@@ -50,6 +50,11 @@ Option A (inline image bytes, fastest to start):
 
 ```bash
 python scripts/duke_gemini_pipeline.py build-jsonl --use-inline-data-from-local
+
+# optional: control Gemini reasoning strength in request generation config
+python scripts/duke_gemini_pipeline.py build-jsonl \
+  --use-inline-data-from-local \
+  --reasoning-strength medium
 ```
 
 Option B (recommended for larger runs, upload files then reference URIs):
