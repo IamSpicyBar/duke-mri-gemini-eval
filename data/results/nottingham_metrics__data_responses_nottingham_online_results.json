@@ -1,0 +1,12 @@
+{
+  "accuracy": 0.4666666666666667,
+  "balanced_accuracy": 0.4354293441514537,
+  "macro_precision": 0.3240740740740741,
+  "macro_recall": 0.4354293441514537,
+  "macro_f1": 0.3522012578616352,
+  "micro_precision": 0.4666666666666667,
+  "micro_recall": 0.4666666666666667,
+  "micro_f1": 0.4666666666666667,
+  "num_predicted": 60,
+  "num_gold": 60
+}

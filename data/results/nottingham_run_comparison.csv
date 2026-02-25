@@ -1,0 +1,6 @@
+run,run_name,response_jsonl,accuracy,macro_f1,num_predicted,num_gold
+data_responses_nottingham_online_image_only_results,Image Only,data/responses/nottingham_online_image_only_results.jsonl,0.4166666666666667,0.3713433772755807,60,60
+data_responses_nottingham_online_non_image_only_results,Non-Image Features Only,data/responses/nottingham_online_non_image_only_results.jsonl,0.4,0.3137254901960784,60,60
+data_responses_nottingham_online_results,Cropped Image Centering Tumor,data/responses/nottingham_online_results.jsonl,0.4666666666666667,0.3522012578616352,60,60
+data_responses_nottingham_online_results_3_flash,Cropped Image (Gemini 3 Flash),data/responses/nottingham_online_results_3_flash.jsonl,0.6166666666666667,0.49947089947089945,60,60
+data_batch_responses_rgb_eval_gemini_2_5_flash,Full Image,data/batch_responses/rgb_eval_gemini_2_5_flash.jsonl,0.43333333333333335,0.32666666666666666,60,60
