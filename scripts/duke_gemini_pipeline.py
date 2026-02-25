@@ -1559,14 +1559,13 @@ def _plot_run_comparison(comparison_rows: List[Dict[str, object]], out_png: Path
         return
 
     run_names = [str(r.get("run_name", r["run"])) for r in comparison_rows]
-    acc = [float(r.get("accuracy", 0.0) or 0.0) for r in comparison_rows]
-    macro_f1 = [float(r.get("macro_f1", 0.0) or 0.0) for r in comparison_rows]
-    metric_names = ["Accuracy", "Macro F1"]
-    metric_values = [acc, macro_f1]
+    metric_names = ["Accuracy", "Micro F1", "Balanced Accuracy", "Macro F1"]
+    metric_keys = ["accuracy", "micro_f1", "balanced_accuracy", "macro_f1"]
+    metric_values = [[float(r.get(k, 0.0) or 0.0) for r in comparison_rows] for k in metric_keys]
 
     n_runs = len(run_names)
     n_metrics = len(metric_names)
-    width = max(1100, 220 * n_runs)
+    width = max(1400, 220 * n_runs)
     height = 680
     left = 90
     right = 340
@@ -1623,7 +1622,7 @@ def _plot_run_comparison(comparison_rows: List[Dict[str, object]], out_png: Path
         draw.text((group_center - twm / 2, top + plot_h + 14), metric, fill=(40, 40, 40), font=font)
 
     # Title + legend with full mapped run names.
-    title = "Nottingham Comparison Grouped by Metric"
+    title = "Nottingham Comparison Grouped by Metric (4 metrics)"
     tw = draw.textlength(title, font=font)
     draw.text(((width - tw) / 2, 20), title, fill=(20, 20, 20), font=font)
     legend_x = width - right + 20
@@ -1673,7 +1672,9 @@ def cmd_evaluate_nottingham_all_runs(args: argparse.Namespace) -> None:
                 "run_name": run_name,
                 "response_jsonl": response_rel,
                 "accuracy": metrics.get("accuracy"),
+                "balanced_accuracy": metrics.get("balanced_accuracy"),
                 "macro_f1": metrics.get("macro_f1"),
+                "micro_f1": metrics.get("micro_f1"),
                 "num_predicted": metrics.get("num_predicted", 0),
                 "num_gold": metrics.get("num_gold", 0),
             }
@@ -1683,7 +1684,17 @@ def cmd_evaluate_nottingham_all_runs(args: argparse.Namespace) -> None:
     with summary_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["run", "run_name", "response_jsonl", "accuracy", "macro_f1", "num_predicted", "num_gold"],
+            fieldnames=[
+                "run",
+                "run_name",
+                "response_jsonl",
+                "accuracy",
+                "micro_f1",
+                "balanced_accuracy",
+                "macro_f1",
+                "num_predicted",
+                "num_gold",
+            ],
         )
         w.writeheader()
         for r in compare_rows:

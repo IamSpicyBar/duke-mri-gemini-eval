@@ -1,7 +1,7 @@
 {
-  "data/responses/nottingham_online_results.jsonl": "Cropped Image Centering Tumor",
-  "data/batch_responses/rgb_eval_gemini_2_5_flash.jsonl": "Full Image",
+  "data/responses/nottingham_online_results.jsonl": "Cropped Image Multi-modal",
+  "data/batch_responses/rgb_eval_gemini_2_5_flash.jsonl": "Full Image Multi-modal",
   "data/responses/nottingham_online_non_image_only_results.jsonl": "Non-Image Features Only",
   "data/responses/nottingham_online_image_only_results.jsonl": "Image Only",
-  "data/responses/nottingham_online_results_3_flash.jsonl": "Cropped Image (Gemini 3 Flash)"
+  "data/responses/nottingham_online_results_3_flash.jsonl": "Cropped Image MM (Gemini 3 Flash)"
 }
