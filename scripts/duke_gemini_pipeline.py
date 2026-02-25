@@ -1493,6 +1493,8 @@ def _evaluate_nottingham_file(
     results_jsonl: Path,
     out_eval_csv: Path,
     out_metrics_json: Path,
+    out_per_class_csv: Path,
+    out_confusion_csv: Path,
 ) -> Dict[str, object]:
     gold = _load_nottingham_gold()
 
@@ -1531,11 +1533,14 @@ def _evaluate_nottingham_file(
         for r in rows:
             w.writerow(r)
 
-    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, precision_score, recall_score
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score, precision_score, recall_score
 
     yt = [r["gold_nottingham"] for r in rows if r["prediction"] in (1, 2, 3)]
     yp = [r["prediction"] for r in rows if r["prediction"] in (1, 2, 3)]
+    labels = [1, 2, 3]
     metrics = {}
+    per_class_rows = []
+    cm = np.zeros((3, 3), dtype=int)
     if yt:
         metrics["accuracy"] = accuracy_score(yt, yp)
         metrics["balanced_accuracy"] = balanced_accuracy_score(yt, yp)
@@ -1547,10 +1552,60 @@ def _evaluate_nottingham_file(
         metrics["micro_f1"] = f1_score(yt, yp, average="micro")
         metrics["num_predicted"] = len(yt)
         metrics["num_gold"] = len(rows)
+        report = classification_report(yt, yp, labels=labels, output_dict=True, zero_division=0)
+        pred_counts = {c: int(sum(1 for p in yp if p == c)) for c in labels}
+        gold_counts = {c: int(sum(1 for g in yt if g == c)) for c in labels}
+        for c in labels:
+            ckey = str(c)
+            cvals = report.get(ckey, {})
+            prow = {
+                "class_label": c,
+                "precision": float(cvals.get("precision", 0.0) or 0.0),
+                "recall": float(cvals.get("recall", 0.0) or 0.0),
+                "f1": float(cvals.get("f1-score", 0.0) or 0.0),
+                "support": int(cvals.get("support", 0) or 0),
+            }
+            per_class_rows.append(prow)
+            metrics[f"class_{c}_precision"] = prow["precision"]
+            metrics[f"class_{c}_recall"] = prow["recall"]
+            metrics[f"class_{c}_f1"] = prow["f1"]
+            metrics[f"class_{c}_support"] = prow["support"]
+            metrics[f"class_{c}_pred_count"] = pred_counts[c]
+            metrics[f"class_{c}_pred_pct"] = pred_counts[c] / len(yp) if len(yp) > 0 else 0.0
+            metrics[f"class_{c}_gold_count"] = gold_counts[c]
+            metrics[f"class_{c}_gold_pct"] = gold_counts[c] / len(yt) if len(yt) > 0 else 0.0
+        cm = confusion_matrix(yt, yp, labels=labels)
+    else:
+        metrics["num_predicted"] = 0
+        metrics["num_gold"] = len(rows)
+        for c in labels:
+            per_class_rows.append({"class_label": c, "precision": 0.0, "recall": 0.0, "f1": 0.0, "support": 0})
+            metrics[f"class_{c}_precision"] = 0.0
+            metrics[f"class_{c}_recall"] = 0.0
+            metrics[f"class_{c}_f1"] = 0.0
+            metrics[f"class_{c}_support"] = 0
+            metrics[f"class_{c}_pred_count"] = 0
+            metrics[f"class_{c}_pred_pct"] = 0.0
+            metrics[f"class_{c}_gold_count"] = 0
+            metrics[f"class_{c}_gold_pct"] = 0.0
     out_metrics_json.parent.mkdir(parents=True, exist_ok=True)
     out_metrics_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    out_per_class_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_per_class_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["class_label", "precision", "recall", "f1", "support"])
+        w.writeheader()
+        for r in per_class_rows:
+            w.writerow(r)
+    out_confusion_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_confusion_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["gold\\pred", "1", "2", "3"])
+        for i, c in enumerate(labels):
+            w.writerow([str(c)] + [int(cm[i, j]) for j in range(len(labels))])
     print(f"Saved evaluation rows to {out_eval_csv}")
     print(f"Saved metrics to {out_metrics_json}: {json.dumps(metrics)}")
+    print(f"Saved per-class metrics to {out_per_class_csv}")
+    print(f"Saved confusion matrix to {out_confusion_csv}")
     return metrics
 
 
@@ -1640,11 +1695,102 @@ def _plot_run_comparison(comparison_rows: List[Dict[str, object]], out_png: Path
     img.save(out_png, format="PNG")
 
 
+def _plot_prediction_distribution_by_run(comparison_rows: List[Dict[str, object]], out_png: Path) -> None:
+    if not comparison_rows:
+        return
+    run_names = [str(r.get("run_name", r["run"])) for r in comparison_rows]
+    pred_dist = [
+        [
+            float(r.get("class_1_pred_pct", 0.0) or 0.0),
+            float(r.get("class_2_pred_pct", 0.0) or 0.0),
+            float(r.get("class_3_pred_pct", 0.0) or 0.0),
+        ]
+        for r in comparison_rows
+    ]
+    gt_dist = [
+        float(comparison_rows[0].get("class_1_gold_pct", 0.0) or 0.0),
+        float(comparison_rows[0].get("class_2_gold_pct", 0.0) or 0.0),
+        float(comparison_rows[0].get("class_3_gold_pct", 0.0) or 0.0),
+    ]
+
+    names = run_names + ["Ground Truth"]
+    dists = pred_dist + [gt_dist]
+    n = len(names)
+    width = max(1100, 170 * n)
+    height = 700
+    left = 90
+    right = 300
+    top = 70
+    bottom = 140
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    group_w = plot_w / max(1, n)
+    bar_w = max(26, int(group_w * 0.45))
+    font = ImageFont.load_default()
+
+    # Class colors: 1,2,3
+    seg_colors = [(66, 133, 244), (52, 168, 83), (234, 67, 53)]
+    seg_labels = ["Class 1", "Class 2", "Class 3"]
+
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.line([(left, top), (left, top + plot_h)], fill=(30, 30, 30), width=2)
+    draw.line([(left, top + plot_h), (left + plot_w, top + plot_h)], fill=(30, 30, 30), width=2)
+
+    for i in range(6):
+        yv = i / 5
+        y = top + int((1.0 - yv) * plot_h)
+        draw.line([(left, y), (left + plot_w, y)], fill=(225, 225, 225), width=1)
+        draw.text((18, y - 6), f"{int(yv*100)}%", fill=(80, 80, 80), font=font)
+
+    for i, name in enumerate(names):
+        cx = left + int((i + 0.5) * group_w)
+        x0 = cx - bar_w // 2
+        x1 = cx + bar_w // 2
+        y_cursor = top + plot_h
+        vals = dists[i]
+        for si, v in enumerate(vals):
+            v = max(0.0, min(1.0, v))
+            h = int(v * plot_h)
+            y0 = y_cursor - h
+            y1 = y_cursor
+            fill = seg_colors[si]
+            outline = tuple(max(0, c - 30) for c in fill)
+            draw.rectangle([(x0, y0), (x1, y1)], fill=fill, outline=outline)
+            if h >= 16:
+                txt = f"{int(round(v*100))}%"
+                tw = draw.textlength(txt, font=font)
+                draw.text((x0 + (bar_w - tw) / 2, y0 + 2), txt, fill=(255, 255, 255), font=font)
+            y_cursor = y0
+        label = name if len(name) <= 16 else name[:16]
+        tw = draw.textlength(label, font=font)
+        draw.text((cx - tw / 2, top + plot_h + 12), label, fill=(60, 60, 60), font=font)
+
+    title = "Prediction Distribution by Run (+ Ground Truth)"
+    tw = draw.textlength(title, font=font)
+    draw.text(((width - tw) / 2, 20), title, fill=(20, 20, 20), font=font)
+
+    legend_x = width - right + 20
+    legend_y = top + 10
+    draw.text((legend_x, legend_y - 20), "Label colors:", fill=(30, 30, 30), font=font)
+    for i, lbl in enumerate(seg_labels):
+        y = legend_y + i * 24
+        fill = seg_colors[i]
+        outline = tuple(max(0, c - 30) for c in fill)
+        draw.rectangle([(legend_x, y), (legend_x + 14, y + 14)], fill=fill, outline=outline)
+        draw.text((legend_x + 20, y - 1), lbl, fill=(50, 50, 50), font=font)
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_png, format="PNG")
+
+
 def cmd_evaluate_nottingham(args: argparse.Namespace) -> None:
     _evaluate_nottingham_file(
         results_jsonl=Path(args.results_jsonl),
         out_eval_csv=Path("data/results/nottingham_eval.csv"),
         out_metrics_json=Path("data/results/nottingham_metrics.json"),
+        out_per_class_csv=Path("data/results/nottingham_per_class.csv"),
+        out_confusion_csv=Path("data/results/nottingham_confusion_matrix.csv"),
     )
 
 
@@ -1665,7 +1811,9 @@ def cmd_evaluate_nottingham_all_runs(args: argparse.Namespace) -> None:
         run_name = run_name_map.get(response_rel, appendix)
         eval_csv = Path(args.results_dir) / f"nottingham_eval__{appendix}.csv"
         metrics_json = Path(args.results_dir) / f"nottingham_metrics__{appendix}.json"
-        metrics = _evaluate_nottingham_file(fp, eval_csv, metrics_json)
+        per_class_csv = Path(args.results_dir) / f"nottingham_per_class__{appendix}.csv"
+        confusion_csv = Path(args.results_dir) / f"nottingham_confusion_matrix__{appendix}.csv"
+        metrics = _evaluate_nottingham_file(fp, eval_csv, metrics_json, per_class_csv, confusion_csv)
         compare_rows.append(
             {
                 "run": appendix,
@@ -1675,6 +1823,15 @@ def cmd_evaluate_nottingham_all_runs(args: argparse.Namespace) -> None:
                 "balanced_accuracy": metrics.get("balanced_accuracy"),
                 "macro_f1": metrics.get("macro_f1"),
                 "micro_f1": metrics.get("micro_f1"),
+                "class_1_f1": metrics.get("class_1_f1"),
+                "class_2_f1": metrics.get("class_2_f1"),
+                "class_3_f1": metrics.get("class_3_f1"),
+                "class_1_pred_pct": metrics.get("class_1_pred_pct"),
+                "class_2_pred_pct": metrics.get("class_2_pred_pct"),
+                "class_3_pred_pct": metrics.get("class_3_pred_pct"),
+                "class_1_gold_pct": metrics.get("class_1_gold_pct"),
+                "class_2_gold_pct": metrics.get("class_2_gold_pct"),
+                "class_3_gold_pct": metrics.get("class_3_gold_pct"),
                 "num_predicted": metrics.get("num_predicted", 0),
                 "num_gold": metrics.get("num_gold", 0),
             }
@@ -1692,6 +1849,15 @@ def cmd_evaluate_nottingham_all_runs(args: argparse.Namespace) -> None:
                 "micro_f1",
                 "balanced_accuracy",
                 "macro_f1",
+                "class_1_f1",
+                "class_2_f1",
+                "class_3_f1",
+                "class_1_pred_pct",
+                "class_2_pred_pct",
+                "class_3_pred_pct",
+                "class_1_gold_pct",
+                "class_2_gold_pct",
+                "class_3_gold_pct",
                 "num_predicted",
                 "num_gold",
             ],
@@ -1702,9 +1868,12 @@ def cmd_evaluate_nottingham_all_runs(args: argparse.Namespace) -> None:
 
     plot_png = Path(args.results_dir) / "nottingham_run_comparison_accuracy_macro_f1.png"
     _plot_run_comparison(compare_rows, plot_png)
+    dist_plot_png = Path(args.results_dir) / "nottingham_run_prediction_distribution.png"
+    _plot_prediction_distribution_by_run(compare_rows, dist_plot_png)
     print(f"Wrote/updated run-name map: {args.run_name_map}")
     print(f"Wrote run comparison CSV: {summary_csv}")
     print(f"Wrote run comparison plot: {plot_png}")
+    print(f"Wrote prediction distribution plot: {dist_plot_png}")
 
 
 def build_parser() -> argparse.ArgumentParser:
