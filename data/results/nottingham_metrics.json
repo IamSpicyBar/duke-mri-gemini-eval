@@ -1,0 +1,6 @@
+{
+  "balanced_accuracy": 0.4354293441514537,
+  "macro_f1": 0.3522012578616352,
+  "num_predicted": 60,
+  "num_gold": 60
+}
