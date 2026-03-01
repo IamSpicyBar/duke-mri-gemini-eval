@@ -107,6 +107,37 @@ Outputs:
 - `data/results/nottingham_eval.csv`
 - `data/results/nottingham_metrics.json`
 
+## XGBoost Baseline
+
+This repo also includes a simple tabular baseline that uses the same clinical feature list as the Gemini non-image prompt, with no image input.
+
+Training setup:
+- Labels come from `Clinical_and_Other_Features_full_label.xlsx` when available, falling back to `Clinical_and_Other_Features.xlsx`
+- Evaluation uses all 100 patients from `validation_dataset_patients_list.csv`
+- Training uses labeled patients outside that 100-patient evaluation cohort
+
+CPU run:
+
+```bash
+python scripts/nottingham_xgb_baseline.py
+```
+
+GPU run:
+
+```bash
+python scripts/nottingham_xgb_baseline.py --device cuda
+```
+
+Main outputs:
+- `data/results/nottingham_xgb_eval_predictions.csv`
+- `data/results/nottingham_xgb_eval_metrics.json`
+- `data/models/nottingham_xgb_baseline.pkl`
+
+GPU outputs (if `--device cuda` is used):
+- `data/results/nottingham_xgb_eval_predictions_cuda.csv`
+- `data/results/nottingham_xgb_eval_metrics_cuda.json`
+- `data/models/nottingham_xgb_baseline_cuda.pkl`
+
 ## Useful Commands
 
 - List recent batch jobs:

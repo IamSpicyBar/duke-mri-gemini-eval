@@ -53,6 +53,7 @@ NOTTINGHAM_FEATURES = [
 ]
 
 CROP_SIZE = 256
+NOTTINGHAM_LABEL_COLUMNS = ("Nottingham_Grade_v2", "Nottingham grade")
 
 
 def _col_idx(cell_ref: str) -> int:
@@ -117,47 +118,53 @@ def parse_xlsx_sheet(xlsx_path: Path, sheet_name: Optional[str] = None) -> List[
 
 
 def parse_clinical_xlsx(xlsx_path: Path) -> Tuple[List[str], Dict[int, Dict[str, str]], List[Dict[str, str]]]:
-    with zipfile.ZipFile(xlsx_path) as zf:
-        sst = _parse_shared_strings(zf)
-        wb = ET.fromstring(zf.read("xl/workbook.xml"))
-        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
-        rel_map = {r.attrib["Id"]: r.attrib["Target"] for r in rels.findall("p:Relationship", NS)}
-        data_sheet = next((sh for sh in wb.findall("a:sheets/a:sheet", NS) if sh.attrib.get("name") == "Data"), None)
-        if data_sheet is None:
-            raise RuntimeError("Could not find 'Data' sheet in clinical workbook")
-        rid = data_sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
-        target = "xl/" + rel_map[rid].lstrip("/")
-        ws = ET.fromstring(zf.read(target))
+    rows = parse_xlsx_sheet(xlsx_path, sheet_name="Data")
+    if not rows:
+        raise RuntimeError("Clinical workbook 'Data' sheet is empty")
 
-        headers: Dict[int, str] = {}
-        legend: Dict[int, str] = {}
-        records: List[Dict[str, str]] = []
-        for row in ws.findall("a:sheetData/a:row", NS):
-            ridx = int(row.attrib.get("r", "0"))
-            cells = {_col_idx(c.attrib.get("r", "A1")): c for c in row.findall("a:c", NS)}
-            if ridx == 2:
-                for i, c in cells.items():
-                    headers[i] = _cell_value(c, sst)
-            elif ridx == 3:
-                for i, c in cells.items():
-                    legend[i] = _cell_value(c, sst)
-            elif ridx >= 4:
-                rec = {}
-                for i, h in headers.items():
-                    if not h:
-                        continue
-                    rec[h] = _cell_value(cells[i], sst) if i in cells else ""
-                if rec.get("Patient ID", ""):
-                    records.append(rec)
+    header_row_idx = next((i for i, row in enumerate(rows) if "Patient ID" in row), None)
+    if header_row_idx is None:
+        raise RuntimeError("Could not locate header row containing 'Patient ID' in clinical workbook")
 
-        max_idx = max(headers) if headers else -1
-        header_list = [headers.get(i, "") for i in range(max_idx + 1)]
-        maps: Dict[int, Dict[str, str]] = {}
-        for i, txt in legend.items():
+    header_list = rows[header_row_idx]
+    patient_idx = header_list.index("Patient ID")
+
+    legend_row_idx: Optional[int] = None
+    data_start_idx = header_row_idx + 1
+    if data_start_idx < len(rows):
+        candidate = rows[data_start_idx]
+        if (len(candidate) <= patient_idx or not candidate[patient_idx].strip()) and any(
+            "=" in cell for cell in candidate if cell
+        ):
+            legend_row_idx = data_start_idx
+            data_start_idx += 1
+
+    maps: Dict[int, Dict[str, str]] = {}
+    if legend_row_idx is not None:
+        for i, txt in enumerate(rows[legend_row_idx]):
             pairs = re.findall(r"([^=,\n]+?)\s*=\s*(-?\d+(?:\.\d+)?)", txt or "")
             if pairs:
                 maps[i] = {code.strip(): label.strip() for label, code in pairs}
-        return header_list, maps, records
+
+    records: List[Dict[str, str]] = []
+    for row in rows[data_start_idx:]:
+        if len(row) <= patient_idx or not row[patient_idx].strip():
+            continue
+        rec = {}
+        for i, header in enumerate(header_list):
+            if not header:
+                continue
+            rec[header] = row[i] if i < len(row) else ""
+        records.append(rec)
+    return header_list, maps, records
+
+
+def get_nottingham_grade_value(record: Dict[str, str]) -> str:
+    for col in NOTTINGHAM_LABEL_COLUMNS:
+        raw = str(record.get(col, "")).strip()
+        if raw and raw not in {"NA", "NC"}:
+            return raw
+    return ""
 
 
 def read_validation_patients(path: Path) -> List[str]:
@@ -366,7 +373,9 @@ def run_prepare_nottingham_rgb(
     base = Path(base_dir)
     manifest = base / "manifest-1654812109500"
     metadata_path = manifest / "metadata.csv"
-    clinical_xlsx = base / "Clinical_and_Other_Features.xlsx"
+    clinical_xlsx = base / "Clinical_and_Other_Features_full_label.xlsx"
+    if not clinical_xlsx.exists():
+        clinical_xlsx = base / "Clinical_and_Other_Features.xlsx"
     val_csv = base / "validation_dataset_patients_list.csv"
     annot_xlsx = base / "Annotation_Boxes.xlsx"
 
@@ -412,8 +421,8 @@ def run_prepare_nottingham_rgb(
     filtered_ids = []
     for pid in val_ids:
         raw = clinical_by_id.get(pid, {})
-        label_raw = str(raw.get("Nottingham grade", "")).strip()
-        if label_raw in {"", "NA", "NC"}:
+        label_raw = get_nottingham_grade_value(raw)
+        if not label_raw:
             continue
         if pid not in annot_by_id:
             continue
@@ -433,7 +442,7 @@ def run_prepare_nottingham_rgb(
         w.writeheader()
         for pid in filtered_ids:
             raw = clinical_by_id[pid]
-            label = int(float(str(raw.get("Nottingham grade", "0")).strip()))
+            label = int(float(get_nottingham_grade_value(raw)))
             row = {"PatientID": pid, "target_nottingham_grade": label}
             for src_col, disp, dec in NOTTINGHAM_FEATURES:
                 row[re.sub(r"\s+", "_", disp.strip().lower())] = _decode(raw.get(src_col, ""), dec)
@@ -533,6 +542,7 @@ def run_prepare_nottingham_rgb(
     info = {
         "validation_total": len(val_ids),
         "labeled_nottingham_total": len(filtered_ids),
+        "clinical_xlsx": str(clinical_xlsx),
         "converted_patients": converted_patients,
         "converted_images": len(manifest_rows),
         "skipped_missing_series": skipped_missing_series,

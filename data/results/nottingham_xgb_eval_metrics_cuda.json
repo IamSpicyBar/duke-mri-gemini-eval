@@ -1,0 +1,166 @@
+{
+  "clinical_xlsx": "/mnt/e/BreastCancerData/Clinical_and_Other_Features_full_label.xlsx",
+  "train_patients": 822,
+  "eval_patients": 100,
+  "accuracy": 0.52,
+  "macro_f1": 0.43620174115530147,
+  "confusion_matrix_labels": [
+    1,
+    2,
+    3
+  ],
+  "confusion_matrix": [
+    [
+      2,
+      22,
+      3
+    ],
+    [
+      4,
+      35,
+      14
+    ],
+    [
+      1,
+      4,
+      15
+    ]
+  ],
+  "classification_report": {
+    "1": {
+      "precision": 0.2857142857142857,
+      "recall": 0.07407407407407407,
+      "f1-score": 0.11764705882352941,
+      "support": 27.0
+    },
+    "2": {
+      "precision": 0.5737704918032787,
+      "recall": 0.660377358490566,
+      "f1-score": 0.6140350877192983,
+      "support": 53.0
+    },
+    "3": {
+      "precision": 0.46875,
+      "recall": 0.75,
+      "f1-score": 0.5769230769230769,
+      "support": 20.0
+    },
+    "accuracy": 0.52,
+    "macro avg": {
+      "precision": 0.44274492583918806,
+      "recall": 0.4948171441882134,
+      "f1-score": 0.43620174115530147,
+      "support": 100.0
+    },
+    "weighted avg": {
+      "precision": 0.4749912177985949,
+      "recall": 0.52,
+      "f1-score": 0.4725879177581965,
+      "support": 100.0
+    }
+  },
+  "feature_importances": [
+    {
+      "feature": "er",
+      "importance": 0.1321921944618225
+    },
+    {
+      "feature": "pr",
+      "importance": 0.1097172275185585
+    },
+    {
+      "feature": "neoadjuvant_chemo",
+      "importance": 0.053262125700712204
+    },
+    {
+      "feature": "her2",
+      "importance": 0.04452032223343849
+    },
+    {
+      "feature": "lymphadenopathy",
+      "importance": 0.04352472350001335
+    },
+    {
+      "feature": "adjuvant_chemo",
+      "importance": 0.041490018367767334
+    },
+    {
+      "feature": "recurrence",
+      "importance": 0.03747721016407013
+    },
+    {
+      "feature": "neoadjuvant_anti-her2",
+      "importance": 0.03632418066263199
+    },
+    {
+      "feature": "adjuvant_endocrine_therapy",
+      "importance": 0.03496900200843811
+    },
+    {
+      "feature": "contralateral_breast_involvement",
+      "importance": 0.03384721651673317
+    },
+    {
+      "feature": "definitive_surgery_type",
+      "importance": 0.03338264673948288
+    },
+    {
+      "feature": "adjuvant_anti-her2",
+      "importance": 0.03336843475699425
+    },
+    {
+      "feature": "skin/nipple_involvement",
+      "importance": 0.03194111958146095
+    },
+    {
+      "feature": "neoadjuvant_endocrine_therapy",
+      "importance": 0.03176337853074074
+    },
+    {
+      "feature": "staging_m",
+      "importance": 0.0313107930123806
+    },
+    {
+      "feature": "staging_n",
+      "importance": 0.031112760305404663
+    },
+    {
+      "feature": "adjuvant_radiation_therapy",
+      "importance": 0.031071415171027184
+    },
+    {
+      "feature": "multicentric/multifocal",
+      "importance": 0.030505049973726273
+    },
+    {
+      "feature": "surgery",
+      "importance": 0.03021450713276863
+    },
+    {
+      "feature": "oophorectomy_for_endocrine_therapy",
+      "importance": 0.029489438980817795
+    },
+    {
+      "feature": "menopause",
+      "importance": 0.028655624017119408
+    },
+    {
+      "feature": "known_ovarian_status",
+      "importance": 0.028111403807997704
+    },
+    {
+      "feature": "pec/chest_involvement",
+      "importance": 0.022367307916283607
+    },
+    {
+      "feature": "neoadjuvant_radiation_therapy",
+      "importance": 0.021145731210708618
+    },
+    {
+      "feature": "metastatic_at_presentation",
+      "importance": 0.018236193805933
+    }
+  ],
+  "predictions_csv": "data/results/nottingham_xgb_eval_predictions_cuda.csv",
+  "model_path": "data/models/nottingham_xgb_baseline_cuda.pkl"
+}
